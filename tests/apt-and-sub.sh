@@ -457,6 +457,12 @@ export PATH="$ORIG_PATH"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$TMP/qr"
 chmod 755 "$TMP/qr"
 export PATH="$TMP:$ORIG_PATH"
+cat > "$TMP/curl" <<'EOF'
+#!/bin/sh
+printf '200\n'
+exit 0
+EOF
+chmod 755 "$TMP/curl"
 mkdir -p "$SUBDIR"
 printf '%s\n' \
   'IP=203.0.113.10' \
@@ -484,6 +490,94 @@ grep -q 'vless://' "$TMP/out-http.txt" && fail http-showed-vless
 [ -f "$TMP/started" ] && fail http-started-tunnel
 grep -q '^open 38921$' "$TMP/fwlog3" || fail http-fw
 ok explicit-http
+
+fresh
+export PATH="$ORIG_PATH"
+mkdir -p "$TMP/bin-fresh"
+cat > "$TMP/bin-fresh/curl" <<'EOF'
+#!/bin/sh
+printf '200\n'
+exit 0
+EOF
+cat > "$TMP/bin-fresh/systemctl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 755 "$TMP/bin-fresh/curl" "$TMP/bin-fresh/systemctl"
+export PATH="$TMP/bin-fresh:$ORIG_PATH"
+write_xray_config "$CONF" 443 dest.example.com 11111111-1111-4111-8111-111111111111 fictional-private-key fictional-sid 0 0
+printf 'fictional-public-key\n' > "$PUBF"
+rm -f "$SUBENV" "$SUBURLF" "$TMP/started-fresh"
+unset SUB_TUNNEL
+get_ip() { printf '%s\n' '203.0.113.10'; }
+systemd_booted() { return 0; }
+start_cloudflare_tunnel() { echo started >> "$TMP/started-fresh"; return 1; }
+fw_open_tcp() { echo "open $1" >> "$TMP/fwfresh"; }
+sub_enable >"$TMP/out-fresh.txt" 2>"$TMP/err-fresh.txt" || { cat "$TMP/err-fresh.txt" >&2; fail fresh-http; }
+grep -q '^http://203.0.113.10:' "$TMP/out-fresh.txt" || fail fresh-not-http
+grep -q 'https://' "$TMP/out-fresh.txt" && fail fresh-https
+grep -q 'vless://' "$TMP/out-fresh.txt" && fail fresh-vless
+grep -q '明文 HTTP' "$TMP/err-fresh.txt" || fail fresh-plain-note
+grep -q '必须能访问 TCP' "$TMP/err-fresh.txt" || fail fresh-port-note
+[ -f "$TMP/started-fresh" ] && fail fresh-started-cloudflare
+ok fresh-http-no-cloudflare
+
+fresh
+export PATH="$ORIG_PATH"
+mkdir -p "$SUBDIR" "$TMP/bin-keep"
+cat > "$TMP/bin-keep/systemctl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 755 "$TMP/bin-keep/systemctl"
+export PATH="$TMP/bin-keep:$ORIG_PATH"
+write_xray_config "$CONF" 443 dest.example.com 11111111-1111-4111-8111-111111111111 fictional-private-key fictional-sid 0 0
+printf 'fictional-public-key\n' > "$PUBF"
+printf '%s\n' \
+  'IP=203.0.113.10' \
+  'SUBPORT=38922' \
+  'SUBPATH=fakepath0123456789abcdef0123456789ab' \
+  'BIND=127.0.0.1' \
+  'TUNNEL=1' \
+  'TUNNEL_URL=https://alpha-fake.trycloudflare.com' \
+  > "$SUBENV"
+unset SUB_TUNNEL
+systemd_booted() { return 0; }
+start_cloudflare_tunnel() { echo kept >> "$TMP/kept"; upsert_env "$SUBENV" TUNNEL_URL "https://alpha-fake.trycloudflare.com"; return 0; }
+stop_tunnel_service() { echo stopped >> "$TMP/kept"; }
+: > "$TMP/kept"
+sub_enable >"$TMP/out-keep.txt" 2>"$TMP/err-keep.txt" || fail keep-https
+grep -q '^kept$' "$TMP/kept" || fail keep-not-refreshed
+grep -q stopped "$TMP/kept" && fail keep-tore-down-https
+grep -q 'https://alpha-fake.trycloudflare.com/fakepath0123456789abcdef0123456789ab' "$TMP/out-keep.txt" || fail keep-url
+ok keep-existing-https
+
+fresh
+export PATH="$ORIG_PATH"
+busy=$(python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",0)); print(s.getsockname()[1]); s.close()')
+python3 -c 'import socket,time,sys; s=socket.socket(); s.bind(("0.0.0.0", int(sys.argv[1]))); s.listen(1); time.sleep(30)' "$busy" &
+busypid=$!
+mkdir -p "$SUBDIR"
+printf '%s\n' \
+  'IP=203.0.113.10' \
+  "SUBPORT=$busy" \
+  'SUBPATH=fakepath0123456789abcdef0123456789ab' \
+  'BIND=0.0.0.0' \
+  'TUNNEL=0' \
+  'TUNNEL_URL=' \
+  > "$SUBENV"
+write_xray_config "$CONF" 443 dest.example.com 11111111-1111-4111-8111-111111111111 fictional-private-key fictional-sid 0 0
+printf 'fictional-public-key\n' > "$PUBF"
+systemd_booted() { return 1; }
+SUB_TUNNEL=0
+rc=0
+sub_enable >"$TMP/out-busy.txt" 2>"$TMP/err-busy.txt" || rc=$?
+kill "$busypid" 2>/dev/null || true
+wait "$busypid" 2>/dev/null || true
+[ "$rc" -ne 0 ] || fail busy-succeeded
+grep -q '已被其他程序占用' "$TMP/err-busy.txt" || fail busy-message
+[ -f "$SUBURLF" ] && fail busy-wrote-url
+ok port-busy
 
 fresh
 export PATH="$ORIG_PATH"
@@ -548,10 +642,10 @@ printf '%s\n' '{"inbounds":[]}' > "$CONF"
 rm -f "$SUBENV"
 sub_enable() { printf '%s\n' "${SUB_TUNNEL:-unset}" > "$TMP/menu-tunnel"; return 0; }
 printf '\n' | enable_subscription_from_menu >"$TMP/out-menu.txt" || fail menu-default
-[ "$(cat "$TMP/menu-tunnel")" = 1 ] || fail menu-default-tunnel
+[ "$(cat "$TMP/menu-tunnel")" = 0 ] || fail menu-default-http
 unset SUB_TUNNEL
-printf 'n\n' | enable_subscription_from_menu >"$TMP/out-menu-n.txt" || fail menu-no
-[ "$(cat "$TMP/menu-tunnel")" = 0 ] || fail menu-no-tunnel
+printf 'y\n' | enable_subscription_from_menu >"$TMP/out-menu-y.txt" || fail menu-yes
+[ "$(cat "$TMP/menu-tunnel")" = 1 ] || fail menu-explicit-https
 mkdir -p "$SUBDIR"
 printf '%s\n' 'TUNNEL=1' > "$SUBENV"
 sub_enable() { echo synced > "$TMP/menu-sync"; return 0; }

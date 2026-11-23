@@ -1,26 +1,30 @@
 # reality-menu
 
-VLESS + Reality 一键管理菜单（基于 XTLS 官方安装脚本），带**通用订阅**。新装默认按 Xray 社区习惯做基础加固：伪装域名、路由黑洞、fail2ban，并生成带免费 HTTPS 入口的订阅。Hysteria2、关闭 SSH 密码、屏蔽大陆地址默认关闭。
+VLESS + Reality 一键管理菜单（基于 XTLS 官方安装脚本），带**通用订阅**。新装默认是 Reality TCP 直连和明文 HTTP 订阅，不启用 Cloudflare。Hysteria2、关闭 SSH 密码、屏蔽大陆地址默认关闭。
 
 ## 一条命令
 
 在 VPS 上用 root 运行。两条命令彼此独立，不会自动从一条切到另一条。
 
-默认是 Reality **TCP 直连**。节点流量不经过 Cloudflare。安装成功时只输出 HTTPS 订阅入口：文件 `/root/reality-sub.url`，以及下一行可复制的订阅 URL。不打印单节点 vless，也不打印二维码。这个 Quick Tunnel 只把订阅页面转到 HTTPS，**不是**数据节点。
+默认是 Reality **TCP 直连**，订阅是普通 **明文 HTTP**。全新安装不安装、也不启用 Cloudflare 订阅隧道或数据隧道。成功时只输出两行：`/root/reality-sub.url`，以及下一行可复制的 `http://` 订阅 URL。不打印单节点 vless，也不打印二维码。
+
+这条订阅不加密，地址等于节点密码。客户端必须能直接访问订阅里的 TCP 端口。脚本不改 SSH；只有本机 ufw 或 firewalld 已经开着时，才放行这一个订阅端口，不改写全局防火墙。端口被占用或本机没有响应时，安装会报错并停下来。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/reality-menu/main/reality-menu.sh) install
 ```
 
-直连受阻时，再执行备用命令。它在已经装好的 Reality 上增加一条 VLESS WebSocket 数据隧道（免费 Quick Tunnel，TLS 停在 `*.trycloudflare.com`），并同时建立另一条 HTTPS 订阅入口。两条 cloudflared 使用不同的本地端口和不同的 systemd 服务；更新其中一条不会重启另一条。订阅内容里会有这个 Cloudflare 数据节点。两条都验证就绪才算成功。失败时会说明是订阅入口还是数据隧道失败，不会改用公网明文 HTTP 冒充成功。不需要自备域名或 Cloudflare 账号，也不保证一定能绕过封锁（HTTPS 本身也是 TCP，这里说的是直连受阻，不是整个 TCP 协议被封）。
+已经在用 HTTPS 订阅时，不带 `SUB_TUNNEL` 再跑 `install` 会沿用原来的隧道，不会静默拆掉。要显式改成 HTTPS 订阅入口（仍然不是数据节点）：
+
+```bash
+SUB_TUNNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/reality-menu/main/reality-menu.sh) install
+```
+
+直连受阻时再执行备用命令。它要求机器上已经有 Reality，然后增加 VLESS WebSocket 数据隧道，并强制另建一条 HTTPS 订阅入口。两条 cloudflared 使用不同本地端口和不同 systemd 服务；更新其中一条不会重启另一条。订阅内容里会有这个 Cloudflare 数据节点。两条都验证就绪才算成功。HTTPS 订阅入口失败时不会退回明文 HTTP 冒充成功。不需要自备域名或 Cloudflare 账号，也不保证一定可用。这里说的是直连受阻，不是整个 TCP 协议被封，HTTPS 本身也基于 TCP。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/reality-menu/main/reality-menu.sh) cf
 ```
-
-`cf` 不重装 Xray，不更换 Reality 的 UUID、密钥和端口。还没有 Reality 时会停下来，请先跑上面的 `install`。
-
-FlClash / Mihomo 若没有按 User-Agent 拿到 YAML，在订阅 URL 后面加上 `?target=clash`。要 base64 节点列表则加 `?target=v2ray`。单节点和二维码仍在菜单 2。
 
 只要 Reality、不要订阅。结束时会说明没有订阅，不会编造订阅 URL，也不会打印单节点链接：
 
@@ -28,13 +32,9 @@ FlClash / Mihomo 若没有按 User-Agent 拿到 YAML，在订阅 URL 后面加�
 SUBSCRIPTION=0 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/reality-menu/main/reality-menu.sh) install
 ```
 
-订阅明确使用明文 HTTP（这是显式选择，不是 HTTPS 失败后的回退）：
+`cf` 不重装 Xray，不更换 Reality 的 UUID、密钥和端口。还没有 Reality 时会停下来。FlClash / Mihomo 若没有按 User-Agent 拿到 YAML，在订阅 URL 后面加上 `?target=clash`。要 base64 节点列表则加 `?target=v2ray`。单节点和二维码仍在菜单 2。
 
-```bash
-SUB_TUNNEL=0 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/reality-menu/main/reality-menu.sh) install
-```
-
-已经装过 Reality、只想补订阅时用菜单 8。这一步只读现有配置，不重启 Xray，也不更换 UUID 或密钥。再执行上面的 `install` 会生成新密钥。已经有 `sub.env` 且没有设置 `SUB_TUNNEL` 时，沿用文件里的 `TUNNEL`。
+已经装过 Reality、只想补订阅时用菜单 8。这一步只读现有配置，不重启 Xray，也不更换 UUID 或密钥。再执行 `install` 会生成新密钥。没有设置 `SUB_TUNNEL` 时，已有订阅沿用 `sub.env` 里的 `TUNNEL`，不会拆掉已有 HTTPS。全新安装才默认明文 HTTP。
 
 不带 `install` 则进入交互菜单。选项 1 会询问端口、伪装域名、是否生成订阅，以及是否启用 Quick Tunnel。
 
@@ -69,7 +69,7 @@ fail2ban、证书、隧道、Hysteria2 任一步检测不到或安装失败，�
 | `HY2_HOP_RANGE` | `20000-50000` | 不能包含 443 |
 | `DISABLE_SSH_PASSWORD` | `0` | `1` 关闭 SSH 密码登录。没有任何公钥就拒绝 |
 | `SUBSCRIPTION` | `1` | `0` 只安装 Reality，不生成订阅，不启用 Quick Tunnel |
-| `SUB_TUNNEL` | 新建订阅为 `1` | `1` 用免费 Quick Tunnel 给订阅 HTTPS。`0` 是显式明文 HTTP。已有订阅且未设置本变量时沿用 `sub.env` |
+| `SUB_TUNNEL` | 全新安装为 `0` | `0` 明文 HTTP。`1` 只给订阅做 HTTPS。未设置时，已有订阅沿用 `sub.env`，不拆掉已有 HTTPS |
 | `BLOCK_CN` | `0` | `1` 把 `geoip:cn` / `geosite:cn` 送进黑洞 |
 
 示例：
@@ -81,17 +81,18 @@ SNI=www.cloudflare.com FAIL2BAN=0 bash <(curl -fsSL https://raw.githubuserconten
 # 带 Hysteria2 和端口跳跃。Reality 仍然在 TCP 443
 HYSTERIA2=1 HY2_HOP=1 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/reality-menu/main/reality-menu.sh) install
 
-# 已经有明文订阅时，改成免费 Quick Tunnel。新建订阅不用写 SUB_TUNNEL
+# 显式改用 HTTPS 订阅入口。默认全新安装不用写，仍是明文 HTTP
 SUB_TUNNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/reality-menu/main/reality-menu.sh) install
 ```
 
-再跑一次 `install` 会换 Reality 密钥。已经装过的 Hysteria2（带 `reality-menu managed` 标记）不会轮换密码和端口。`HY2_HOP` 没写时保留原来的跳跃设置；写了 `0` 或 `1` 才改。`BLOCK_CN` 没写时沿用现有配置。`SUB_TUNNEL` 没写时，已有订阅沿用 `sub.env` 里的 `TUNNEL`；还没有订阅时新建为 Quick Tunnel。
+再跑一次 `install` 会换 Reality 密钥。已经装过的 Hysteria2（带 `reality-menu managed` 标记）不会轮换密码和端口。`HY2_HOP` 没写时保留原来的跳跃设置；写了 `0` 或 `1` 才改。`BLOCK_CN` 没写时沿用现有配置。`SUB_TUNNEL` 没写时，已有订阅沿用 `sub.env` 里的 `TUNNEL`；还没有订阅时用明文 HTTP。
 
 ## 不会做的事
 
 - 不跑 `apt full-upgrade` / `dist-upgrade`，不修改 apt 源，不删除 apt/dpkg 锁。只在缺少安装依赖时 `apt-get update` 并安装这些包。
 - 不改内核，不重启机器。BBR 仍只是写入 sysctl，和以前一样。
-- 不把默认的 Reality 流量转到 Cloudflare。`install` 的 Quick Tunnel 只转发订阅页面。`cf` 才会另开一条 VLESS WebSocket 数据隧道，并且必须同时有 HTTPS 订阅入口。
+- 不把默认安装接到 Cloudflare。全新 `install` 的订阅是明文 HTTP。`SUB_TUNNEL=1` 才只为订阅做 HTTPS。`cf` 才会另开 VLESS WebSocket 数据隧道，并且必须同时有独立的 HTTPS 订阅入口；那一步失败不会退回明文。
+- 不改 SSH，不改写全局防火墙。明文订阅端口若被占用或本机没有响应，会报错停止。
 - 不自动升级 Xray。选项 6 才换版本，默认还是 v26.7.28。
 - 不把 Reality 从 TCP 443 挪走。`PORT` 仍可自己指定。
 - 不默认开启 `limitFallback`。
@@ -122,9 +123,9 @@ SUB_TUNNEL=1 bash <(curl -fsSL https://raw.githubusercontent.com/ccav001eth/real
 
 **关闭 SSH 密码。** 只有某个用户的 `authorized_keys` 里至少有一把公钥，并且 `PubkeyAuthentication` 不是 no，才会写 `/etc/ssh/sshd_config.d/00-reality-menu-password.conf`。`sshd -t` 失败，或生效结果仍允许密码，就整份回滚。用 reload，不 restart。装完后请另开一个终端确认能登录。
 
-**订阅入口和数据隧道是两件事。** 默认的 Quick Tunnel 只给订阅页面提供 HTTPS，Reality 仍是到这台机器的 TCP 直连。`reality-tunnel` 重启后订阅主机名可能变化，查看订阅时会重写 `/root/reality-sub.url`。它失败时不会改用公网明文 HTTP。
+**订阅入口和数据隧道是两件事。** 全新安装的订阅默认是明文 HTTP，不经过 Cloudflare。它不加密，客户端必须能访问订阅端口。`SUB_TUNNEL=1` 才把订阅改成只监听本机的 HTTPS 入口，失败时不会退回明文。已有 HTTPS 且没有设置 `SUB_TUNNEL` 时保持原样。
 
-**Cloudflare 数据备用。** 命令 `cf` 或菜单 12 在直连受阻时使用。Xray 在 `127.0.0.1` 增加一个 VLESS WebSocket 入站，另一条 cloudflared（`reality-cf`）把 `https://*.trycloudflare.com` 转到这个本地端口。客户端看到的是 TLS、端口 443、WebSocket。订阅 HTTPS 入口仍由 `reality-tunnel` 负责，本地端口不同。只有数据隧道和 HTTPS 订阅入口都验证就绪，命令才成功。任一失败都会说明是哪一部分，并撤回没配对成功的数据入站。不保证一定可用，也不把直连受阻说成整个 TCP 协议被封。
+**Cloudflare 数据备用。** 命令 `cf` 或菜单 12 在直连受阻时使用。它会强制建立独立的 HTTPS 订阅入口，并在 `127.0.0.1` 增加 VLESS WebSocket，由另一条 cloudflared（`reality-cf`）转发。两条隧道端口不同。只有两者都验证就绪才成功。HTTPS 订阅入口失败不会改用公网明文 HTTP。不保证一定可用，也不把直连受阻说成整个 TCP 协议被封。
 
 **屏蔽大陆地址。** 默认否。打开后，经本节点访问中国大陆网站会进黑洞。这和客户端配置里的 `GEOIP,CN,DIRECT` 不是一回事：那条是让客户端自己直连，服务器规则是节点不再转发这类目标。
 

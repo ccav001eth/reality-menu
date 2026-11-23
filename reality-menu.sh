@@ -2,10 +2,9 @@
 # 梯哥 VLESS + Reality 管理菜单（基于 XTLS 官方安装脚本）
 # 用法：root 执行  bash reality-menu.sh
 #       默认安装    bash reality-menu.sh install
-#                   Reality 走 TCP 直连。Quick Tunnel 若开启，只做 HTTPS 订阅入口，不承载节点流量。
+#                   Reality TCP 直连，订阅默认是明文 HTTP。不安装 Cloudflare。
 #       直连受阻备用 bash reality-menu.sh cf
-#                   另开 VLESS WebSocket 数据隧道，并同时建立 HTTPS 订阅入口。两条 cloudflared 分开。
-#                   不保证一定可用。不会自动从直连切过去。
+#                   在已有 Reality 上增加 VLESS WebSocket 数据隧道，并强制独立的 HTTPS 订阅入口。
 #
 # 环境变量（非交互 install 时读取；交互菜单里选项 1 会询问，并把这里的值当作默认）：
 #   PORT                    Reality 端口，默认 443
@@ -18,14 +17,15 @@
 #   HY2_HOP_RANGE           默认 20000-50000，不能包含 443
 #   DISABLE_SSH_PASSWORD    默认 0。1 关闭 SSH 密码登录；没有公钥则拒绝
 #   SUBSCRIPTION            默认 1。0/false/no/off 只安装 Reality，不生成订阅，不启用 Quick Tunnel
-#   SUB_TUNNEL              新建订阅默认 1。免费 Cloudflare Quick Tunnel 只给订阅提供 HTTPS。
-#                           0 表示这次明确使用明文 HTTP，不是 HTTPS 失败后的自动回退。
-#                           已有 sub.env 且未设置本变量时，沿用其中的 TUNNEL。
+#   SUB_TUNNEL              全新安装默认 0：明文 HTTP 订阅，不安装 Cloudflare。
+#                           1 只给订阅做 HTTPS 入口，不承载节点流量；失败不会改成明文冒充成功。
+#                           已有 sub.env 且未设置本变量时沿用其中的 TUNNEL，不拆掉已有 HTTPS。
 #   BLOCK_CN                默认 0。1 把 geoip:cn / geosite:cn 送进黑洞（国内网站经本节点将打不开）
 #
 # 不会做：整机升级已安装软件包、修改 apt 源、删除 apt/dpkg 锁、改内核、重启机器、自动升级 Xray、
-#         把 Reality 挪离 443、默认开启 limitFallback、默认把 Reality 流量交给 Cloudflare、
-#         直连受阻时自动切换。订阅入口或数据隧道失败时，不会改用公网明文 HTTP 冒充成功。
+#         把 Reality 挪离 443、默认开启 limitFallback、默认安装 Cloudflare 订阅隧道或数据隧道、
+#         直连受阻时自动切换、改 SSH、改写全局防火墙。
+#         显式要求的 HTTPS 订阅或 cf 失败时，不会改用公网明文 HTTP 冒充成功。
 CONF=${CONF:-/usr/local/etc/xray/config.json}
 LINKF=${LINKF:-/root/reality-link.txt}
 PUBF=${PUBF:-/usr/local/etc/xray/reality-pub.txt}
@@ -1057,7 +1057,8 @@ sub_show() {
   # shellcheck disable=SC1090
   . "$SUBENV"
   if [ "${TUNNEL:-0}" != 1 ]; then
-    echo "明文 HTTP 订阅（SUB_TUNNEL=0），不是 HTTPS。" >&2
+    echo "订阅是明文 HTTP，不是 HTTPS，也不加密。地址等于节点密码。客户端必须能访问 TCP ${SUBPORT}。" >&2
+    echo "脚本没有修改 SSH。已经开启的 ufw 或 firewalld 只会放行这个订阅端口，不会改写全局防火墙。" >&2
   else
     echo "这是 HTTPS 订阅入口，不是节点，也不是 Cloudflare 数据隧道。" >&2
   fi
@@ -1206,6 +1207,38 @@ EOF
   return 0
 }
 
+sub_port_available() {
+  local port=$1
+  if systemd_booted && systemctl is-active --quiet reality-sub; then
+    return 0
+  fi
+  python3 - "$port" <<'PY'
+import socket, sys
+sock = socket.socket()
+try:
+    sock.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+sys.exit(0)
+PY
+}
+
+probe_sub_http() {
+  local code="" i=0
+  # shellcheck disable=SC1090
+  . "$SUBENV"
+  command -v curl >/dev/null 2>&1 || { echo "没有 curl，不能确认订阅端口可访问。" >&2; return 1; }
+  while [ "$i" -lt 5 ]; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${SUBPORT}/${SUBPATH}" || true)
+    [ "$code" = 200 ] && return 0
+    i=$((i + 1))
+    sleep 0.2
+  done
+  return 1
+}
+
 sub_enable() {
   local p sp spath ip want new_env=0
   if [ ! -f "$CONF" ]; then
@@ -1237,9 +1270,9 @@ sub_enable() {
     chmod 600 "$SUBENV"
   fi
   if [ -n "${SUB_TUNNEL+x}" ] && [ -n "${SUB_TUNNEL}" ]; then
-    want=$(env_flag SUB_TUNNEL 1)
+    want=$(env_flag SUB_TUNNEL 0)
   elif [ "$new_env" = 1 ]; then
-    want=1
+    want=0
   else
     want=$(awk -F= '$1=="TUNNEL"{print $2}' "$SUBENV" 2>/dev/null || true)
     [ "$want" = 1 ] || want=0
@@ -1269,6 +1302,11 @@ sub_enable() {
     . "$SUBENV"
     fw_open_tcp "$SUBPORT"
   fi
+  if ! sub_port_available "$SUBPORT"; then
+    echo "订阅端口 ${SUBPORT}/TCP 已被其他程序占用，订阅没有启动。" >&2
+    rm -f "$SUBURLF"
+    return 1
+  fi
   write_sub_server
   if systemd_booted; then
     systemctl daemon-reload || true
@@ -1287,6 +1325,12 @@ sub_enable() {
       return 1
     fi
   fi
+  if [ "$want" != 1 ] && ! probe_sub_http; then
+    echo "明文 HTTP 订阅在 127.0.0.1:${SUBPORT} 没有响应，未把它写成成功结果。" >&2
+    echo "订阅不加密。客户端还必须能访问 TCP ${SUBPORT}。脚本没有修改 SSH，也没有改写全局防火墙。" >&2
+    rm -f "$SUBURLF"
+    return 1
+  fi
   if [ "${SUB_QUIET:-0}" = 1 ]; then
     return 0
   fi
@@ -1294,7 +1338,7 @@ sub_enable() {
 }
 
 enable_subscription_from_menu() {
-  local tun_def=1
+  local tun_def=0
   if [ ! -f "$CONF" ]; then
     echo "请先安装 Reality（选项 1）"
     return 1
@@ -1307,8 +1351,8 @@ enable_subscription_from_menu() {
   if [ -f "$SUBENV" ]; then
     tun_def=0
   fi
-  echo "免费 Quick Tunnel 只给订阅做 HTTPS，不代理 Reality 流量，也不需要自备域名。"
-  echo "建立失败时不会改成公网明文 HTTP。reality-tunnel 重启后主机名可能变化。"
+  echo "全新安装默认是明文 HTTP 订阅。已有 HTTPS 订阅时，直接回车会保留。"
+  echo "选是只给订阅做 HTTPS，不承载节点流量。建立失败时不会改成明文 HTTP。"
   prompt_flag SUB_TUNNEL "$tun_def" "是否启用免费 Quick Tunnel HTTPS 订阅入口" || return 1
   sub_enable
 }
@@ -2524,7 +2568,7 @@ remove_managed_hysteria() {
 # --- 安装参数 ---
 
 collect_options() {
-  local ans def_sni cur_cn=0 cur_hop=0 cur_tunnel=0 tun_def=1
+  local ans def_sni cur_cn=0 cur_hop=0 cur_tunnel=0 tun_def=0
   if config_blocks_cn "$CONF"; then
     cur_cn=1
   fi
@@ -2568,7 +2612,7 @@ collect_options() {
       if [ -f "$SUBENV" ]; then
         tun_def=$cur_tunnel
       fi
-      prompt_flag SUB_TUNNEL "$tun_def" "是否启用免费 Quick Tunnel 作为 HTTPS 订阅入口（不需要域名；失败不会改成明文 HTTP；重启后主机名可能变）" || return 1
+      prompt_flag SUB_TUNNEL "$tun_def" "是否启用免费 Quick Tunnel 作为 HTTPS 订阅入口（直接回车为否，使用明文 HTTP；选是失败时不会改成明文）" || return 1
     fi
     echo "屏蔽中国大陆地址后，经本节点将无法打开国内网站（geoip:cn / geosite:cn 进入黑洞）。客户端自己的国内直连规则不受影响。"
     prompt_flag BLOCK_CN "$cur_cn" "是否屏蔽 geoip:cn / geosite:cn" || return 1
