@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # 梯哥 VLESS + Reality 管理菜单（基于 XTLS 官方安装脚本）
 # 用法：root 执行  bash reality-menu.sh
-#       一键安装    bash reality-menu.sh install
+#       默认安装    bash reality-menu.sh install
+#                   Reality 走 TCP 直连。Quick Tunnel 若开启，只做 HTTPS 订阅入口，不承载节点流量。
+#       直连受阻备用 bash reality-menu.sh cf
+#                   另开 VLESS WebSocket 数据隧道，并同时建立 HTTPS 订阅入口。两条 cloudflared 分开。
+#                   不保证一定可用。不会自动从直连切过去。
 #
 # 环境变量（非交互 install 时读取；交互菜单里选项 1 会询问，并把这里的值当作默认）：
 #   PORT                    Reality 端口，默认 443
@@ -20,8 +24,8 @@
 #   BLOCK_CN                默认 0。1 把 geoip:cn / geosite:cn 送进黑洞（国内网站经本节点将打不开）
 #
 # 不会做：整机升级已安装软件包、修改 apt 源、删除 apt/dpkg 锁、改内核、重启机器、自动升级 Xray、
-#         把 Reality 挪离 443、默认开启 limitFallback、把 Reality 流量交给 Cloudflare。
-#         Quick Tunnel 失败时不会打开公网明文订阅。
+#         把 Reality 挪离 443、默认开启 limitFallback、默认把 Reality 流量交给 Cloudflare、
+#         直连受阻时自动切换。订阅入口或数据隧道失败时，不会改用公网明文 HTTP 冒充成功。
 CONF=${CONF:-/usr/local/etc/xray/config.json}
 LINKF=${LINKF:-/root/reality-link.txt}
 PUBF=${PUBF:-/usr/local/etc/xray/reality-pub.txt}
@@ -30,6 +34,11 @@ SUBENV=${SUBENV:-$SUBDIR/sub.env}
 SUBURLF=${SUBURLF:-/root/reality-sub.url}
 SUBPY=${SUBPY:-$SUBDIR/sub-server.py}
 SUBSVC=${SUBSVC:-/etc/systemd/system/reality-sub.service}
+SUBTUNSVC=${SUBTUNSVC:-/etc/systemd/system/reality-tunnel.service}
+CFDIR=${CFDIR:-/usr/local/etc/reality-cf}
+CFENV=${CFENV:-$CFDIR/cf.env}
+CFSVC=${CFSVC:-/etc/systemd/system/reality-cf.service}
+CFTAG="reality-menu-cf"
 HYENV=${HYENV:-/etc/hysteria/reality-menu.env}
 HYCONF=${HYCONF:-/etc/hysteria/config.yaml}
 HYLINK=${HYLINK:-/root/hysteria-link.txt}
@@ -777,6 +786,7 @@ CONF = os.environ.get("REALITY_XRAY_CONF", "/usr/local/etc/xray/config.json")
 PUBF = os.environ.get("REALITY_PUBF", "/usr/local/etc/xray/reality-pub.txt")
 LINKF = os.environ.get("REALITY_LINKF", "/root/reality-link.txt")
 HYENV = os.environ.get("REALITY_HYENV", "/etc/hysteria/reality-menu.env")
+CFENV = os.environ.get("REALITY_CFENV", "/usr/local/etc/reality-cf/cf.env")
 ENV = load_env_file(SUBENV_PATH)
 CLASH_UA = re.compile(r"clash|mihomo|meta|stash|openclash|verge|flclash", re.I)
 
@@ -823,13 +833,44 @@ def hy2_node():
         return None
     return env
 
+def cf_node():
+    # 只在配置里的本机 WebSocket 入站和 cf.env 完全一致时才发布。
+    # 这是数据节点，不是订阅页面的 HTTPS 入口。
+    env = load_env_file(CFENV)
+    host = (env.get("HOST") or "").strip()
+    wspath = (env.get("WSPATH") or "").strip()
+    url = (env.get("URL") or "").strip()
+    if not host or not wspath.startswith("/") or not url.startswith("https://"):
+        return None
+    if url.split("://", 1)[-1].strip("/") != host:
+        return None
+    try:
+        cfg = json.load(open(CONF, encoding="utf-8"))
+    except OSError:
+        return None
+    for ib in cfg.get("inbounds") or []:
+        if ib.get("tag") != "reality-menu-cf" or ib.get("protocol") != "vless":
+            continue
+        if ib.get("listen") != "127.0.0.1":
+            return None
+        ss = ib.get("streamSettings") or {}
+        if ss.get("network") != "ws" or ss.get("security") not in ("none", "", None):
+            return None
+        if ((ss.get("wsSettings") or {}).get("path") or "") != wspath:
+            return None
+        clients = (ib.get("settings") or {}).get("clients") or []
+        if not clients or not clients[0].get("id"):
+            return None
+        return dict(name="CF-ws-%s" % host, host=host, port=443, uuid=clients[0]["id"], path=wspath)
+    return None
+
 def yaml_scalar(value):
     text = "" if value is None else str(value)
     if re.fullmatch(r"[A-Za-z0-9._-]+", text or ""):
         return text
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
-def v2ray(ns, hy):
+def v2ray(ns, hy, cf=None):
     # 不写 support-x25519mlkem768。那是 mihomo 的 reality-opts，放进 vless:// 不能让 Shadowrocket 握手。
     links = []
     for n in ns:
@@ -846,9 +887,12 @@ def v2ray(ns, hy):
             q["pinSHA256"] = hy["PIN"]
         name = urllib.parse.quote(hy.get("NAME") or ("Hy2-%s" % ip))
         links.append("hysteria2://%s@%s:%s?%s#%s" % (auth, ip, port, urllib.parse.urlencode(q), name))
+    if cf:
+        q = urllib.parse.urlencode(dict(encryption="none", security="tls", sni=cf["host"], fp="chrome", type="ws", host=cf["host"], path=cf["path"]))
+        links.append("vless://%s@%s:%s?%s#%s" % (cf["uuid"], cf["host"], cf["port"], q, urllib.parse.quote(cf["name"])))
     return base64.b64encode("\n".join(links).encode()).decode()
 
-def clash(ns, hy):
+def clash(ns, hy, cf=None):
     names = []
     y = ["mixed-port: 7890", "allow-lan: true", "mode: rule", "log-level: info", "proxies:"]
     for n in ns:
@@ -873,6 +917,12 @@ def clash(ns, hy):
         y.append("    skip-cert-verify: true")
         if hy.get("PIN"):
             y.append("    fingerprint: %s" % yaml_scalar(hy["PIN"]))
+    if cf:
+        names.append(cf["name"])
+        y += ['  - name: "%s"' % cf["name"].replace('"', ""), "    type: vless", "    server: %s" % yaml_scalar(cf["host"]),
+              "    port: %s" % cf["port"], "    uuid: %s" % cf["uuid"], "    network: ws", "    tls: true", "    udp: true",
+              "    servername: %s" % yaml_scalar(cf["host"]), "    client-fingerprint: chrome", "    ws-opts:",
+              "      path: %s" % yaml_scalar(cf["path"]), "      headers:", "        Host: %s" % yaml_scalar(cf["host"])]
     joined = ", ".join('"%s"' % n.replace('"', "") for n in names)
     y += ["proxy-groups:", '  - name: "PROXY"', "    type: select", '    proxies: ["AUTO", %s, DIRECT]' % joined,
           '  - name: "AUTO"', "    type: url-test", "    url: http://www.gstatic.com/generate_204", "    interval: 300",
@@ -883,7 +933,7 @@ def clash(ns, hy):
     return "\n".join(y) + "\n"
 
 if os.environ.get("REALITY_PRINT_LINKS") == "1":
-    text = base64.b64decode(v2ray(reality_nodes(), hy2_node())).decode()
+    text = base64.b64decode(v2ray(reality_nodes(), hy2_node(), cf_node())).decode()
     sys.stdout.write(text if text.endswith("\n") or not text else text + "\n")
     raise SystemExit(0)
 
@@ -902,7 +952,8 @@ class H(BaseHTTPRequestHandler):
         ua = self.headers.get("User-Agent", "")
         is_clash = t == "clash" or (t != "v2ray" and bool(CLASH_UA.search(ua)))
         try:
-            body = (clash(reality_nodes(), hy2_node()) if is_clash else v2ray(reality_nodes(), hy2_node())).encode()
+            nodes, hy, cf = reality_nodes(), hy2_node(), cf_node()
+            body = (clash(nodes, hy, cf) if is_clash else v2ray(nodes, hy, cf)).encode()
         except Exception:
             self.send_response(500); self.end_headers(); return
         self.send_response(200)
@@ -1007,6 +1058,8 @@ sub_show() {
   . "$SUBENV"
   if [ "${TUNNEL:-0}" != 1 ]; then
     echo "明文 HTTP 订阅（SUB_TUNNEL=0），不是 HTTPS。" >&2
+  else
+    echo "这是 HTTPS 订阅入口，不是节点，也不是 Cloudflare 数据隧道。" >&2
   fi
   printf '%s\n' "$SUBURLF"
   printf '%s\n' "$U"
@@ -1065,44 +1118,58 @@ fw_open_udp_range() {
 }
 
 stop_tunnel_service() {
-  if [ -f /etc/systemd/system/reality-tunnel.service ] && systemd_booted; then
+  if [ -f "$SUBTUNSVC" ] && systemd_booted; then
     systemctl disable --now reality-tunnel >/dev/null 2>&1 || true
   fi
 }
 
+unit_serves_port() {
+  local unit=$1 port=$2 line
+  systemctl is-active --quiet "$unit" || return 1
+  line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null || true)
+  printf '%s\n' "$line" | grep -q "127.0.0.1:${port}"
+}
+
+ensure_cloudflared() {
+  local arch url
+  if ! systemd_booted; then
+    echo "没有 systemd，不能常驻 cloudflared。" >&2
+    return 1
+  fi
+  arch=$(linux_arch) || { echo "认不出 CPU 架构，不能下载 cloudflared。" >&2; return 1; }
+  if [ ! -x /usr/local/bin/cloudflared ]; then
+    url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
+    if ! download_bin "$url" /usr/local/bin/cloudflared; then
+      echo "下载 cloudflared 失败。" >&2
+      return 1
+    fi
+  fi
+  if ! /usr/local/bin/cloudflared --version >/dev/null 2>&1; then
+    echo "cloudflared 无法运行，已删除下载的文件。" >&2
+    rm -f /usr/local/bin/cloudflared
+    return 1
+  fi
+}
+
 read_quick_tunnel_url() {
-  local found=""
+  local unit=${1:-reality-tunnel} found=""
   command -v journalctl >/dev/null 2>&1 || return 1
-  found=$(journalctl -u reality-tunnel -n 200 -o cat --no-pager 2>/dev/null | grep -oE 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' | tail -n1 || true)
+  found=$(journalctl -u "$unit" -n 200 -o cat --no-pager 2>/dev/null | grep -oE 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' | tail -n1 || true)
   [ -n "$found" ] || return 1
   printf '%s\n' "$found"
 }
 
 start_cloudflare_tunnel() {
-  local arch url port found=""
+  local port found=""
   # shellcheck disable=SC1090
   . "$SUBENV"
   port=$SUBPORT
-  if ! systemd_booted; then
-    warn "没有 systemd，不能常驻 cloudflared。"
+  if ! ensure_cloudflared; then
     return 1
   fi
-  arch=$(linux_arch) || { warn "认不出 CPU 架构，跳过 cloudflared。"; return 1; }
-  if [ ! -x /usr/local/bin/cloudflared ]; then
-    url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
-    if ! download_bin "$url" /usr/local/bin/cloudflared; then
-      warn "下载 cloudflared 失败。"
-      return 1
-    fi
-  fi
-  if ! /usr/local/bin/cloudflared --version >/dev/null 2>&1; then
-    warn "cloudflared 无法运行，已删除下载的文件。"
-    rm -f /usr/local/bin/cloudflared
-    return 1
-  fi
-  cat > /etc/systemd/system/reality-tunnel.service <<EOF
+  cat > "$SUBTUNSVC" <<EOF
 [Unit]
-Description=Reality subscription Cloudflare quick tunnel
+Description=Reality subscription HTTPS entrance
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -1113,30 +1180,29 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload || true
-  local need_restart=1
-  if systemctl is-active --quiet reality-tunnel; then
-    if systemctl show reality-tunnel -p ExecStart --value 2>/dev/null | grep -q "127.0.0.1:${port}"; then
-      need_restart=0
-    fi
+  local need_restart=1 tries=${SUB_TUNNEL_WAIT:-30} i=0
+  if unit_serves_port reality-tunnel "$port"; then
+    need_restart=0
   fi
   systemctl enable reality-tunnel >/dev/null 2>&1 || true
   if [ "$need_restart" = 1 ]; then
-    systemctl restart reality-tunnel || { warn "cloudflared 启动失败。"; return 1; }
+    systemctl restart reality-tunnel || { echo "订阅 HTTPS 入口的 cloudflared 启动失败。" >&2; return 1; }
   fi
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-    found=$(read_quick_tunnel_url || true)
+  while [ "$i" -lt "$tries" ]; do
+    found=$(read_quick_tunnel_url reality-tunnel || true)
     if [ -n "$found" ]; then
       break
     fi
-    sleep 1
+    i=$((i + 1))
+    [ "$i" -lt "$tries" ] && sleep 1
   done
   if [ -z "$found" ]; then
-    warn "没有从 cloudflared 日志里拿到 trycloudflare 地址。"
+    echo "没有从订阅隧道日志里拿到 trycloudflare 地址。" >&2
     journalctl -u reality-tunnel -n 40 --no-pager >&2 || true
     return 1
   fi
   upsert_env "$SUBENV" TUNNEL_URL "$found" || return 1
-  echo "Cloudflare Quick Tunnel: ${found}"
+  echo "HTTPS 订阅入口：${found}" >&2
   return 0
 }
 
@@ -1221,6 +1287,9 @@ sub_enable() {
       return 1
     fi
   fi
+  if [ "${SUB_QUIET:-0}" = 1 ]; then
+    return 0
+  fi
   sub_show || return 1
 }
 
@@ -1242,6 +1311,370 @@ enable_subscription_from_menu() {
   echo "建立失败时不会改成公网明文 HTTP。reality-tunnel 重启后主机名可能变化。"
   prompt_flag SUB_TUNNEL "$tun_def" "是否启用免费 Quick Tunnel HTTPS 订阅入口" || return 1
   sub_enable
+}
+
+reality_fingerprint() {
+  python3 - "$CONF" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+for ib in cfg.get("inbounds") or []:
+    ss = ib.get("streamSettings") or {}
+    if ib.get("protocol") != "vless" or ss.get("security") != "reality":
+        continue
+    rs = ss.get("realitySettings") or {}
+    client = ((ib.get("settings") or {}).get("clients") or [{}])[0]
+    print("|".join([
+        str(ib.get("port", "")),
+        str(client.get("id", "")),
+        str(client.get("flow", "")),
+        str(rs.get("privateKey", "")),
+        str(rs.get("dest", "")),
+        ",".join(rs.get("shortIds") or []),
+        ",".join(rs.get("serverNames") or []),
+    ]))
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+choose_cf_port() {
+  local p="" reality="" sub=""
+  if [ -f "$CFENV" ]; then
+    p=$(awk -F= '$1=="PORT"{print $2}' "$CFENV")
+    if validate_port "$p" && [ "$p" != 443 ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  fi
+  reality=$(python3 - "$CONF" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+for ib in cfg.get("inbounds") or []:
+    ss = ib.get("streamSettings") or {}
+    if ib.get("protocol") == "vless" and ss.get("security") == "reality":
+        print(ib.get("port", ""))
+        break
+PY
+)
+  if [ -f "$SUBENV" ]; then
+    sub=$(awk -F= '$1=="SUBPORT"{print $2}' "$SUBENV")
+  fi
+  if [ -n "${CF_PORT:-}" ] && validate_port "$CF_PORT" && [ "$CF_PORT" != 443 ] && [ "$CF_PORT" != "$reality" ] && [ "$CF_PORT" != "$sub" ]; then
+    printf '%s\n' "$CF_PORT"
+    return 0
+  fi
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    p=$(rand_int 20000 59999)
+    [ "$p" = 443 ] && continue
+    [ -n "$reality" ] && [ "$p" = "$reality" ] && continue
+    [ -n "$sub" ] && [ "$p" = "$sub" ] && continue
+    printf '%s\n' "$p"
+    return 0
+  done
+  return 1
+}
+
+choose_cf_path() {
+  local p=""
+  if [ -f "$CFENV" ]; then
+    p=$(awk -F= '$1=="WSPATH"{print $2}' "$CFENV")
+    case "$p" in
+      /*) printf '%s\n' "$p"; return 0 ;;
+    esac
+  fi
+  case "${CF_WSPATH:-}" in
+    /*) printf '%s\n' "$CF_WSPATH"; return 0 ;;
+  esac
+  p=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+  printf '/%s\n' "$p"
+}
+
+upsert_cf_inbound() {
+  local port=$1 wspath=$2
+  python3 - "$CONF" "$port" "$wspath" "$CFTAG" <<'PY'
+import json, os, sys
+conf, port, wspath, tag = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+cfg = json.load(open(conf, encoding="utf-8"))
+uuid = ""
+for ib in cfg.get("inbounds") or []:
+    ss = ib.get("streamSettings") or {}
+    if ib.get("protocol") == "vless" and ss.get("security") == "reality":
+        clients = (ib.get("settings") or {}).get("clients") or []
+        if clients and clients[0].get("id"):
+            uuid = clients[0]["id"]
+            break
+if not uuid:
+    sys.exit(2)
+desired = {
+    "listen": "127.0.0.1",
+    "port": port,
+    "protocol": "vless",
+    "tag": tag,
+    "settings": {"clients": [{"id": uuid}], "decryption": "none"},
+    "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": wspath}},
+    "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+}
+inbounds = cfg.setdefault("inbounds", [])
+found = None
+for ib in inbounds:
+    if ib.get("tag") == tag:
+        found = ib
+        break
+if found == desired:
+    print("unchanged")
+    print(uuid)
+    sys.exit(0)
+if found is None:
+    inbounds.append(desired)
+else:
+    found.clear()
+    found.update(desired)
+tmp = conf + ".cf.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, conf)
+print("updated")
+print(uuid)
+PY
+}
+
+reload_xray_for_cf() {
+  if ! systemd_booted; then
+    echo "没有 systemd。备用入站已写入，但没有重载 Xray。" >&2
+    return 0
+  fi
+  if systemctl reload xray >/dev/null 2>&1; then
+    echo "已重载 Xray 以加载备用入站。Reality 的 UUID、密钥和端口没有改。" >&2
+    return 0
+  fi
+  echo "Xray 不能 reload，改为重启以加载备用入站。Reality 的 UUID、密钥和端口没有改。" >&2
+  systemctl restart xray
+}
+
+stop_cf_data_tunnel() {
+  if systemd_booted; then
+    systemctl disable --now reality-cf >/dev/null 2>&1 || true
+  fi
+  rm -f "$CFSVC"
+  if systemd_booted; then
+    systemctl daemon-reload || true
+  fi
+}
+
+start_cf_data_tunnel() {
+  local port=$1 found="" tries=${CF_TUNNEL_WAIT:-30} i=0
+  ensure_cloudflared || return 1
+  mkdir -p "$(dirname "$CFSVC")"
+  cat > "$CFSVC" <<EOF
+[Unit]
+Description=Cloudflare quick tunnel for VLESS WebSocket data
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:${port}
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload || true
+  if ! unit_serves_port reality-cf "$port"; then
+    systemctl enable reality-cf >/dev/null 2>&1 || true
+    if ! systemctl restart reality-cf; then
+      echo "Cloudflare 数据隧道启动失败。" >&2
+      return 1
+    fi
+  fi
+  while [ "$i" -lt "$tries" ]; do
+    found=$(read_quick_tunnel_url reality-cf || true)
+    if [ -n "$found" ]; then
+      break
+    fi
+    i=$((i + 1))
+    [ "$i" -lt "$tries" ] && sleep 1
+  done
+  if [ -z "$found" ]; then
+    echo "没有从数据隧道日志拿到 trycloudflare 地址。" >&2
+    journalctl -u reality-cf -n 40 --no-pager >&2 || true
+    return 1
+  fi
+  printf '%s\n' "$found"
+}
+
+write_cf_env() {
+  local port=$1 wspath=$2 url=$3 host
+  case "$url" in
+    https://*.trycloudflare.com) ;;
+    *) return 1 ;;
+  esac
+  host=${url#https://}
+  host=${host%%/*}
+  mkdir -p "$(dirname "$CFENV")"
+  chmod 700 "$(dirname "$CFENV")"
+  {
+    printf 'PORT=%s\n' "$port"
+    printf 'WSPATH=%s\n' "$wspath"
+    printf 'HOST=%s\n' "$host"
+    printf 'URL=%s\n' "$url"
+  } > "$CFENV"
+  chmod 600 "$CFENV"
+}
+
+subscription_https_ready() {
+  local tunnel="" url="" bind="" port=""
+  [ -f "$SUBENV" ] || return 1
+  tunnel=$(awk -F= '$1=="TUNNEL"{print $2}' "$SUBENV")
+  url=$(awk -F= '$1=="TUNNEL_URL"{print $2}' "$SUBENV")
+  bind=$(awk -F= '$1=="BIND"{print $2}' "$SUBENV")
+  port=$(awk -F= '$1=="SUBPORT"{print $2}' "$SUBENV")
+  [ "$tunnel" = 1 ] || return 1
+  [ "$bind" = 127.0.0.1 ] || return 1
+  case "$url" in
+    https://*.trycloudflare.com) ;;
+    *) return 1 ;;
+  esac
+  if systemd_booted; then
+    unit_serves_port reality-tunnel "$port" || return 1
+    systemctl is-active --quiet reality-sub || return 1
+  fi
+  return 0
+}
+
+ensure_cf_subscription_https() {
+  if subscription_https_ready; then
+    return 0
+  fi
+  if ! SUB_QUIET=1 SUB_TUNNEL=1 sub_enable; then
+    echo "HTTPS 订阅入口失败。没有改用公网明文 HTTP。" >&2
+    return 1
+  fi
+  if ! subscription_https_ready; then
+    echo "HTTPS 订阅入口没有验证就绪。没有改用公网明文 HTTP。" >&2
+    return 1
+  fi
+}
+
+cf_links_match() {
+  local text="" host="" wspath="" enc="" uuid=""
+  [ -f "$SUBPY" ] || return 1
+  [ -f "$CFENV" ] || return 1
+  host=$(awk -F= '$1=="HOST"{print $2}' "$CFENV")
+  wspath=$(awk -F= '$1=="WSPATH"{print $2}' "$CFENV")
+  uuid=$(python3 - "$CONF" "$CFTAG" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+for ib in cfg.get("inbounds") or []:
+    if ib.get("tag") == sys.argv[2]:
+        clients = (ib.get("settings") or {}).get("clients") or []
+        if clients:
+            print(clients[0].get("id", ""))
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+) || return 1
+  text=$(REALITY_SUBENV="$SUBENV" REALITY_XRAY_CONF="$CONF" REALITY_PUBF="$PUBF" REALITY_LINKF="$LINKF" REALITY_HYENV="$HYENV" REALITY_CFENV="$CFENV" REALITY_PRINT_LINKS=1 python3 "$SUBPY" 2>/dev/null || true)
+  enc=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$wspath")
+  printf '%s\n' "$text" | grep -q 'type=ws' || return 1
+  printf '%s\n' "$text" | grep -q 'security=tls' || return 1
+  printf '%s\n' "$text" | grep -F -q "$host:443" || return 1
+  printf '%s\n' "$text" | grep -F -q "path=${enc}" || return 1
+  printf '%s\n' "$text" | grep -F -q "$uuid" || return 1
+  return 0
+}
+
+rollback_cf_inbound() {
+  local bak=$1 changed=$2
+  if [ -n "$bak" ] && [ -f "$bak" ]; then
+    cp -a "$bak" "$CONF" || true
+  fi
+  if [ "$changed" = 1 ]; then
+    reload_xray_for_cf || true
+  fi
+  stop_cf_data_tunnel
+  rm -f "$CFENV"
+}
+
+enable_cf_backup() {
+  local before="" port="" wspath="" state_text="" state="" uuid="" url="" bak="" changed=0
+  if [ ! -f "$CONF" ]; then
+    echo "还没有 Reality 配置。请先执行 install。cf 不会重装 Xray，也不会生成新密钥。" >&2
+    return 1
+  fi
+  before=$(reality_fingerprint) || {
+    echo "配置里没有 Reality 入站。cf 不会另写一份 Reality。" >&2
+    return 1
+  }
+  if ! ensure_cf_subscription_https; then
+    echo "HTTPS 订阅入口失败。Cloudflare 数据隧道没有启动。本次不视为成功。" >&2
+    return 1
+  fi
+  port=$(choose_cf_port) || { echo "选不到备用入站的本地端口。" >&2; return 1; }
+  wspath=$(choose_cf_path) || return 1
+  bak=$(make_backup "$CONF") || { echo "备份 Xray 配置失败，没有改配置。" >&2; return 1; }
+  if ! state_text=$(upsert_cf_inbound "$port" "$wspath"); then
+    echo "写入备用入站失败，已恢复原配置。" >&2
+    cp -a "$bak" "$CONF" || true
+    return 1
+  fi
+  state=$(printf '%s\n' "$state_text" | sed -n '1p')
+  uuid=$(printf '%s\n' "$state_text" | sed -n '2p')
+  if [ -z "$uuid" ]; then
+    echo "备用入站没有客户端 UUID，已恢复原配置。" >&2
+    cp -a "$bak" "$CONF" || true
+    return 1
+  fi
+  if [ "$(reality_fingerprint)" != "$before" ]; then
+    echo "Reality 入站被意外改动，已恢复。" >&2
+    cp -a "$bak" "$CONF" || true
+    return 1
+  fi
+  if [ "$state" = updated ]; then
+    changed=1
+    XRAY_BAK=$bak
+    if ! xray_test; then
+      echo "备用入站没有通过配置测试，已恢复原配置。" >&2
+      cp -a "$bak" "$CONF" || true
+      return 1
+    fi
+    if ! reload_xray_for_cf; then
+      echo "加载备用入站失败，正在恢复原配置。" >&2
+      rollback_cf_inbound "$bak" 1
+      return 1
+    fi
+  fi
+  if ! url=$(start_cf_data_tunnel "$port"); then
+    echo "Cloudflare 数据隧道失败。正在撤回备用入站。本次不视为成功。" >&2
+    rollback_cf_inbound "$bak" "$changed"
+    return 1
+  fi
+  case "$url" in
+    https://*.trycloudflare.com) ;;
+    *)
+      echo "数据隧道地址不可用。本次不视为成功。" >&2
+      rollback_cf_inbound "$bak" "$changed"
+      return 1
+      ;;
+  esac
+  if ! write_cf_env "$port" "$wspath" "$url"; then
+    echo "没有写上数据隧道参数。本次不视为成功。" >&2
+    rollback_cf_inbound "$bak" "$changed"
+    return 1
+  fi
+  if ! cf_links_match; then
+    echo "订阅里的 Cloudflare 节点和实际入站不一致。已撤回数据隧道。本次不视为成功。" >&2
+    rollback_cf_inbound "$bak" "$changed"
+    return 1
+  fi
+  if ! subscription_https_ready; then
+    echo "HTTPS 订阅入口在数据隧道之后没有保持可用。本次不视为成功。" >&2
+    rollback_cf_inbound "$bak" "$changed"
+    return 1
+  fi
+  sub_show || return 1
+  echo "上面两行是 HTTPS 订阅入口，不是单节点链接，也不是数据隧道地址。订阅内容里有 Cloudflare VLESS WebSocket 备用节点。直连受阻时可以改用它，但不保证一定可用。" >&2
+  return 0
 }
 
 sub_reset() {
@@ -1277,7 +1710,7 @@ sub_disable() {
   if [ -n "$port" ]; then
     fw_close_tcp "$port"
   fi
-  rm -f "$SUBSVC" /etc/systemd/system/reality-tunnel.service "$SUBURLF"
+  rm -f "$SUBSVC" "$SUBTUNSVC" "$SUBURLF"
   if [ "$SUBDIR" = /usr/local/etc/reality-sub ]; then
     rm -rf "$SUBDIR"
   else
@@ -2483,6 +2916,12 @@ uninstall_all() {
     warn "下载 Xray 卸载脚本失败。"
   fi
   sub_disable || true
+  stop_cf_data_tunnel || true
+  if [ "$CFDIR" = /usr/local/etc/reality-cf ]; then
+    rm -rf "$CFDIR"
+  else
+    rm -f "$CFENV"
+  fi
   remove_managed_hysteria || true
   remove_fail2ban_jail || true
   restore_ssh_password || true
@@ -2495,7 +2934,7 @@ menu_loop() {
   while true; do
     printf '\n'
     echo "====== 梯哥 Reality 管理 ======"
-    echo " 1. 安装 / 重装（默认 Xray ${XRAY_PIN}，dest ${DEFAULT_SNI}；默认生成订阅）"
+    echo " 1. 安装 / 重装（默认 Xray ${XRAY_PIN}，Reality TCP 直连；不启用 Cloudflare 数据隧道）"
     echo " 2. 查看导入链接和二维码"
     echo " 3. 查看运行状态"
     echo " 4. 查看最近日志"
@@ -2506,6 +2945,7 @@ menu_loop() {
     echo " 9. 重置订阅地址"
     echo "10. 关闭订阅"
     echo "11. 扫描本机网段，挑选 Reality 伪装域名（RealiTLScanner）"
+    echo "12. 直连受阻时启用 Cloudflare 备用（VLESS WebSocket 数据隧道 + HTTPS 订阅入口）"
     echo " 0. 退出"
     read -r -p "请选择: " c || exit 0
     case $c in
@@ -2520,6 +2960,7 @@ menu_loop() {
       9) sub_reset || true ;;
       10) sub_disable || true ;;
       11) scan_dest_menu || true ;;
+      12) enable_cf_backup || true ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -2552,6 +2993,10 @@ main() {
     AUTO=1
     deploy
     finish_install $?
+    exit $?
+  fi
+  if [ "${1:-}" = cf ]; then
+    enable_cf_backup
     exit $?
   fi
   menu_loop

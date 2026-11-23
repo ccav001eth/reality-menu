@@ -413,10 +413,10 @@ grep -q 'vless://' "$SUBURLF" && fail tunnel-url-is-vless
 [ "$(stat -c %a "$SUBURLF")" = 600 ] || fail tunnel-url-mode
 printf '%s\n%s\n' "$SUBURLF" "$url" > "$TMP/expect-tok.txt"
 cmp "$TMP/expect-tok.txt" "$TMP/out-tok.txt" || fail tunnel-output
+grep -q '不是节点' "$TMP/err-tok.txt" || fail tunnel-not-node
+grep -q '订阅入口' "$TMP/err-tok.txt" || fail tunnel-entry-note
 grep -q 'vless://' "$TMP/out-tok.txt" && fail tunnel-showed-vless
-grep -q 'qrencode\|二维码' "$TMP/out-tok.txt" && fail tunnel-showed-qr-text
 [ ! -s "$QRLOG" ] || fail tunnel-called-qr
-[ ! -s "$TMP/err-tok.txt" ] || fail tunnel-extra-stderr
 grep -q '^open ' "$TMP/fwlog2" && fail tunnel-ok-opened
 grep -q 'restart xray' "$SYSLOG" && fail restarted-xray
 grep -q 'restart reality-sub' "$SYSLOG" || fail sub-service
